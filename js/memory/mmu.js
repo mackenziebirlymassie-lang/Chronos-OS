@@ -1,6 +1,6 @@
 /**
  * ChronosOS - Memory Management Unit (MMU) & Physical RAM Simulator
- * Hardware-level virtual address translation, page tables, and physical frame allocation
+ * Hardware-level virtual address translation, page tables, TLB cache, and word-aligned frame allocation
  */
 
 import { PageFlag, SystemConstants, KernelEvent } from '../core/types.js';
@@ -19,10 +19,16 @@ export class MMU {
 
     // Frame allocation bitmap (1 bit per frame, 0 = Free, 1 = Allocated)
     this.frameBitmap = new Uint8Array(Math.ceil(this.totalFrames / 8));
+    this.frameBitmap32 = new Uint32Array(this.frameBitmap.buffer);
     this.allocatedFramesCount = 0;
+    this._frameWordCursor = 0;
 
     // Per-Process Page Tables: Map<pid, Map<virtualPageNum, PageTableEntry>>
     this.processPageTables = new Map();
+
+    // Hardware Translation Lookaside Buffer (TLB) - 64-entry LRU Cache
+    this.tlbCapacity = 64;
+    this.tlb = new Map(); // key: (pid << 20) | vPage -> { frameIndex, flags, physBase, pageEntry }
 
     // MMU Telemetry & Statistics
     this.stats = {
@@ -65,29 +71,71 @@ export class MMU {
   }
 
   /**
-   * Allocate an available physical frame from the free-frame pool
+   * Allocate an available physical frame using fast 32-bit word scanning with cursor
    * @returns {number} Frame Index, or -1 if Out Of Memory (OOM)
    */
   allocatePhysicalFrame() {
-    for (let i = 0; i < this.totalFrames; i++) {
-      if (!this._isFrameAllocated(i)) {
-        this._setFrameAllocated(i, true);
-        // Zero-fill new allocated frame
-        const byteStart = i * this.pageSize;
-        this.ramView.fill(0, byteStart, byteStart + this.pageSize);
-        return i;
+    const numWords = this.frameBitmap32.length;
+    const startWord = this._frameWordCursor;
+
+    for (let attempt = 0; attempt < numWords; attempt++) {
+      const wordIdx = (startWord + attempt) % numWords;
+      const word = this.frameBitmap32[wordIdx];
+
+      if (word !== 0xFFFFFFFF) {
+        // Invert to find lowest zero bit
+        const inverted = ~word >>> 0;
+        const lowestBit = Math.log2(inverted & -inverted);
+        const frameIndex = (wordIdx * 32) + lowestBit;
+
+        if (frameIndex < this.totalFrames) {
+          this._setFrameAllocated(frameIndex, true);
+          this._frameWordCursor = wordIdx;
+
+          // Zero-fill new allocated frame
+          const byteStart = frameIndex * this.pageSize;
+          this.ramView.fill(0, byteStart, byteStart + this.pageSize);
+          return frameIndex;
+        }
       }
     }
+
     DOMBus.publish(KernelEvent.MEMORY_PRESSURE, { allocated: this.allocatedFramesCount, total: this.totalFrames });
     return -1;
   }
 
   /**
-   * Release a previously allocated physical frame
+   * Release a previously allocated physical frame and update search cursor
    */
   freePhysicalFrame(frameIndex) {
     if (frameIndex >= 0 && frameIndex < this.totalFrames) {
       this._setFrameAllocated(frameIndex, false);
+      const wordIdx = Math.floor(frameIndex / 32);
+      if (wordIdx < this._frameWordCursor) {
+        this._frameWordCursor = wordIdx;
+      }
+    }
+  }
+
+  /**
+   * Flush or invalidate TLB entries for a given process or specific page
+   */
+  flushTLB(pid = null, virtualPageNum = null) {
+    if (pid === null) {
+      this.tlb.clear();
+      return;
+    }
+
+    if (virtualPageNum !== null) {
+      const key = (pid << 20) | (virtualPageNum & 0xFFFFF);
+      this.tlb.delete(key);
+      return;
+    }
+
+    for (const [key] of this.tlb.entries()) {
+      if ((key >> 20) === pid) {
+        this.tlb.delete(key);
+      }
     }
   }
 
@@ -113,6 +161,7 @@ export class MMU {
       }
     }
     this.processPageTables.delete(pid);
+    this.flushTLB(pid);
   }
 
   /**
@@ -131,10 +180,13 @@ export class MMU {
       flags,
       allocatedAt: performance.now(),
     });
+
+    // Invalidate stale TLB entry if mapping changed
+    this.flushTLB(pid, virtualPageNum);
   }
 
   /**
-   * Translate a process virtual address into a physical byte offset
+   * Translate a process virtual address into a physical byte offset using hardware TLB cache
    * @param {number} pid - Process ID
    * @param {number} virtualAddress - Virtual memory address
    * @param {boolean} isWrite - True if operation is write
@@ -144,30 +196,58 @@ export class MMU {
     this.stats.translationsCount++;
     const virtualPageNum = Math.floor(virtualAddress / this.pageSize);
     const offset = virtualAddress % this.pageSize;
+    const tlbKey = (pid << 20) | (virtualPageNum & 0xFFFFF);
 
-    const pageTable = this.processPageTables.get(pid);
-    if (!pageTable) {
-      this._handlePageFault(pid, virtualAddress, 'NO_ADDRESS_SPACE');
-      return -1;
+    let tlbEntry = this.tlb.get(tlbKey);
+
+    if (tlbEntry) {
+      this.stats.tlbHits++;
+      // Refresh LRU position
+      this.tlb.delete(tlbKey);
+      this.tlb.set(tlbKey, tlbEntry);
+    } else {
+      this.stats.tlbMisses++;
+      const pageTable = this.processPageTables.get(pid);
+      if (!pageTable) {
+        this._handlePageFault(pid, virtualAddress, 'NO_ADDRESS_SPACE');
+        return -1;
+      }
+
+      const entry = pageTable.get(virtualPageNum);
+      if (!entry || !(entry.flags & PageFlag.PRESENT)) {
+        this._handlePageFault(pid, virtualAddress, 'PAGE_NOT_PRESENT');
+        return -1;
+      }
+
+      tlbEntry = {
+        frameIndex: entry.frameIndex,
+        flags: entry.flags,
+        physBase: entry.frameIndex * this.pageSize,
+        pageEntry: entry,
+      };
+
+      // LRU Eviction if capacity exceeded
+      if (this.tlb.size >= this.tlbCapacity) {
+        const oldestKey = this.tlb.keys().next().value;
+        this.tlb.delete(oldestKey);
+      }
+      this.tlb.set(tlbKey, tlbEntry);
     }
 
-    const entry = pageTable.get(virtualPageNum);
-    if (!entry || !(entry.flags & PageFlag.PRESENT)) {
-      this._handlePageFault(pid, virtualAddress, 'PAGE_NOT_PRESENT');
-      return -1;
-    }
-
-    if (isWrite && !(entry.flags & PageFlag.WRITABLE)) {
+    if (isWrite && !(tlbEntry.flags & PageFlag.WRITABLE)) {
       this._handlePageFault(pid, virtualAddress, 'WRITE_PROTECTION_VIOLATION');
       return -1;
     }
 
-    entry.flags |= PageFlag.ACCESSED;
+    tlbEntry.flags |= PageFlag.ACCESSED;
+    if (tlbEntry.pageEntry) tlbEntry.pageEntry.flags |= PageFlag.ACCESSED;
+
     if (isWrite) {
-      entry.flags |= PageFlag.DIRTY;
+      tlbEntry.flags |= PageFlag.DIRTY;
+      if (tlbEntry.pageEntry) tlbEntry.pageEntry.flags |= PageFlag.DIRTY;
     }
 
-    return (entry.frameIndex * this.pageSize) + offset;
+    return tlbEntry.physBase + offset;
   }
 
   _handlePageFault(pid, virtualAddress, reason) {
@@ -197,28 +277,63 @@ export class MMU {
   }
 
   /**
-   * Write string to virtual address
+   * Write string to virtual address with page-chunked batch copy
    */
   writeString(pid, virtualAddress, str) {
     const encoder = new TextEncoder();
     const bytes = encoder.encode(str);
-    for (let i = 0; i < bytes.length; i++) {
-      this.writeByte(pid, virtualAddress + i, bytes[i]);
+    const totalBytes = bytes.length;
+    let srcOffset = 0;
+    let curVAddr = virtualAddress;
+
+    while (srcOffset < totalBytes) {
+      const physOffset = this.translate(pid, curVAddr, true);
+      if (physOffset === -1) return srcOffset;
+
+      const bytesInCurrentPage = this.pageSize - (curVAddr % this.pageSize);
+      const chunkSize = Math.min(totalBytes - srcOffset, bytesInCurrentPage);
+
+      this.ramView.set(bytes.subarray(srcOffset, srcOffset + chunkSize), physOffset);
+      srcOffset += chunkSize;
+      curVAddr += chunkSize;
     }
-    this.writeByte(pid, virtualAddress + bytes.length, 0); // null-terminator
-    return bytes.length;
+
+    this.writeByte(pid, curVAddr, 0); // null-terminator
+    this.stats.writesCount += totalBytes + 1;
+    return totalBytes;
   }
 
   /**
-   * Read null-terminated string from virtual address
+   * Read null-terminated string from virtual address with page-chunked scanning
    */
   readString(pid, virtualAddress, maxLen = 256) {
     const bytes = [];
-    for (let i = 0; i < maxLen; i++) {
-      const b = this.readByte(pid, virtualAddress + i);
-      if (b === 0) break;
-      bytes.push(b);
+    let curVAddr = virtualAddress;
+    let readTotal = 0;
+
+    while (readTotal < maxLen) {
+      const physOffset = this.translate(pid, curVAddr, false);
+      if (physOffset === -1) break;
+
+      const bytesInCurrentPage = this.pageSize - (curVAddr % this.pageSize);
+      const chunkSize = Math.min(maxLen - readTotal, bytesInCurrentPage);
+      let foundNull = false;
+
+      for (let i = 0; i < chunkSize; i++) {
+        const val = this.ramView[physOffset + i];
+        if (val === 0) {
+          foundNull = true;
+          break;
+        }
+        bytes.push(val);
+      }
+
+      readTotal += chunkSize;
+      curVAddr += chunkSize;
+      if (foundNull) break;
     }
+
+    this.stats.readsCount += bytes.length;
     const decoder = new TextDecoder();
     return decoder.decode(new Uint8Array(bytes));
   }
@@ -257,6 +372,8 @@ export class MMU {
     const usedBytes = this.allocatedFramesCount * this.pageSize;
     const freeBytes = this.totalMemoryBytes - usedBytes;
     const utilizationPct = ((usedBytes / this.totalMemoryBytes) * 100).toFixed(1);
+    const totalLookups = this.stats.tlbHits + this.stats.tlbMisses;
+    const tlbHitRatePct = totalLookups > 0 ? ((this.stats.tlbHits / totalLookups) * 100).toFixed(1) : '0.0';
 
     return {
       totalBytes: this.totalMemoryBytes,
@@ -265,6 +382,7 @@ export class MMU {
       totalFrames: this.totalFrames,
       allocatedFrames: this.allocatedFramesCount,
       utilizationPct: parseFloat(utilizationPct),
+      tlbHitRatePct: parseFloat(tlbHitRatePct),
       ...this.stats,
     };
   }
